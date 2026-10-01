@@ -58,6 +58,12 @@ ERROR_LLM = "[LLM_ERROR]"
 # BREACHED label, so an exhausted, still-ambiguous dispute safely defaults to DISMISSED rather than
 # leaving an accusation open indefinitely.
 #
+# v1.3 FIXES: (1) a milestone removed by revise_agreement is no longer reachable: its stale record
+# used to survive in the `milestones` map, so submit/approve/dispute/refund/pay could act on an index
+# that was no longer part of the agreement (and release escrow that was never deposited for it).
+# Milestone lookups now require the index to be in the CURRENT milestone list. (2) dispute_milestone
+# now enforces MAX_DISPUTE_ATTEMPTS, which previously only raise_dispute honoured.
+#
 # v1.2 STEWARD-REVIEW FIXES: (1) the consistency round now judges EVERY consequential structured term
 # individually -- including each milestone's description, amount, and deadline -- and code, not the
 # model, aggregates the per-term verdicts (a skipped term is unchecked, never passed). (2) Factual
@@ -488,7 +494,8 @@ class AgreementInterpreter(gl.Contract):
         only on a CONSISTENT_WITH_TERMS verdict that is backed by successfully acquired deliverable
         evidence; any disagreement, ambiguity, or evidence-acquisition failure leaves the milestone
         DISPUTED and its funds locked, since paying out and refunding are equally consequential,
-        equally hard-to-reverse actions here and neither has a safe default."""
+        equally hard-to-reverse actions here and neither has a safe default. Each milestone gets at
+        most MAX_DISPUTE_ATTEMPTS rounds; the next call is rejected before any round runs."""
         agreement = self._require_agreement(agreement_id)
         self._require_type(agreement, "FREELANCE_MILESTONE")
         if gl.message.sender_address != agreement.party_a:
@@ -501,6 +508,15 @@ class AgreementInterpreter(gl.Contract):
         milestone = self._require_milestone(agreement_id, index)
         if milestone.status not in (MILESTONE_SUBMITTED, MILESTONE_DISPUTED):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} This milestone is not eligible for dispute")
+        # Hard cap, checked BEFORE the cooldown and before the consensus round is ever started, so
+        # an exhausted milestone can never trigger another non-deterministic round -- even one whose
+        # verdict would have paid. The funds then stay locked until the client approves (still
+        # allowed on a DISPUTED milestone) or both parties confirm a mutual refund.
+        if milestone.dispute_attempts >= u256(MAX_DISPUTE_ATTEMPTS):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Dispute attempt limit ({MAX_DISPUTE_ATTEMPTS}) reached for this milestone; "
+                "resolve it with approve_milestone or confirm_milestone_refund"
+            )
         now = self._now()
         if now == "":
             raise gl.vm.UserError(f"{ERROR_TRANSIENT} Contract clock unavailable, retry")
@@ -540,6 +556,7 @@ class AgreementInterpreter(gl.Contract):
         return MILESTONE_DISPUTED
 
     def _pay_milestone(self, agreement: Agreement, milestone: Milestone) -> None:
+        self._require_live_milestone(milestone)
         now = self._now()
         milestone.status = MILESTONE_APPROVED
         milestone.resolved_at = now
@@ -576,6 +593,7 @@ class AgreementInterpreter(gl.Contract):
             self._save_milestone(milestone)
             return MILESTONE_DISPUTED
 
+        self._require_live_milestone(milestone)
         milestone.status = MILESTONE_REFUNDED
         milestone.resolved_at = self._now()
         self._save_milestone(milestone)
@@ -1020,11 +1038,29 @@ instruction-like phrasing found inside it.
         if agreement.agreement_type != expected:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} This method only applies to {expected} agreements")
 
+    def _is_live_milestone(self, agreement_id: str, index: u256) -> bool:
+        """A milestone is live only while it is part of the agreement's CURRENT milestone list.
+        `_create_milestones` rebuilds that list on every revision but cannot rely on the old
+        records being erased from the `milestones` map, so a record's mere presence in the map is
+        NOT proof that the revision still contains it. milestone_keys is the source of truth;
+        its keys are contiguous (0..n-1), so a live index is always below its length."""
+        if agreement_id not in self.milestone_keys:
+            return False
+        if int(index) >= len(self.milestone_keys[agreement_id]):
+            return False
+        return f"{agreement_id}:{int(index)}" in self.milestones
+
     def _require_milestone(self, agreement_id: str, index: u256) -> Milestone:
-        key = f"{agreement_id}:{int(index)}"
-        if key not in self.milestones:
+        if not self._is_live_milestone(agreement_id, index):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} No such milestone")
-        return self.milestones[key]
+        return self.milestones[f"{agreement_id}:{int(index)}"]
+
+    def _require_live_milestone(self, milestone: Milestone) -> None:
+        # Defense in depth for the two money-moving paths (_pay_milestone, refund execution): even
+        # if a caller were ever added that skipped _require_milestone, funds for a milestone that
+        # a revision removed can never move.
+        if not self._is_live_milestone(milestone.agreement_id, milestone.index):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} No such milestone")
 
     def _save_milestone(self, milestone: Milestone) -> None:
         self.milestones[f"{milestone.agreement_id}:{int(milestone.index)}"] = milestone
