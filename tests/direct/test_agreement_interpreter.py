@@ -945,3 +945,138 @@ def test_milestone_view_exposes_evidence_fields(contract, direct_vm, direct_bob,
     m = contract.get_milestone(aid, 0)
     assert m["deliverable_url"] == EVIDENCE_URL
     assert m["client_evidence_url"] == ""
+
+
+# --- v1.3 regression: milestones removed by a revision, and the dispute attempt cap ---
+
+def _active_after_removing_milestone_1(contract, direct_vm, bob, carol):
+    """Propose 2 milestones (600 + 400), revise down to 1 (600), fund, accept, submit milestone 0.
+    Index 1 is now a removed milestone whose stale record the contract must never act on."""
+    warp_to(direct_vm, NOW)
+    mock_consistency(direct_vm, "CONSISTENT")
+    aid = propose_freelance(contract, direct_vm, bob, carol, amounts=(600, 400))
+    direct_vm.sender = bob
+    contract.revise_agreement(
+        aid, FREELANCE_TEXT, 0, 0, "", "", 0,
+        ["Design mockups"], [600], ["2099-03-01"], 0,
+    )
+    assert contract.get_agreement(aid)["status"] == "PROPOSED"
+    assert len(contract.list_milestones(aid)) == 1
+    direct_vm.value = 600
+    contract.fund_milestone_escrow(aid)
+    direct_vm.value = 0
+    direct_vm.sender = carol
+    contract.accept_agreement(aid)
+    contract.submit_milestone(aid, 0, "Delivered the design mockups as agreed.", EVIDENCE_URL)
+    return aid
+
+
+def test_removed_milestone_index_cannot_be_submitted(contract, direct_vm, direct_bob, direct_carol):
+    aid = _active_after_removing_milestone_1(contract, direct_vm, direct_bob, direct_carol)
+    direct_vm.sender = direct_carol
+    with pytest.raises(Exception, match="No such milestone"):
+        contract.submit_milestone(aid, 1, "Delivered a milestone that no longer exists.", EVIDENCE_URL)
+
+
+def test_removed_milestone_index_cannot_be_approved_or_paid(contract, direct_vm, direct_bob, direct_carol):
+    aid = _active_after_removing_milestone_1(contract, direct_vm, direct_bob, direct_carol)
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception, match="No such milestone"):
+        contract.approve_milestone(aid, 1)
+    a = contract.get_agreement(aid)
+    assert a["escrow_balance"] == "600"  # nothing left the escrow
+    assert a["status"] == "ACTIVE"
+
+
+def test_removed_milestone_index_cannot_be_disputed(contract, direct_vm, direct_bob, direct_carol):
+    aid = _active_after_removing_milestone_1(contract, direct_vm, direct_bob, direct_carol)
+    mock_interpretation(direct_vm, "CONSISTENT_WITH_TERMS")  # would pay if the round ever ran
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception, match="No such milestone"):
+        contract.dispute_milestone(aid, 1, "Disputing a removed milestone.", "")
+    assert contract.get_agreement(aid)["escrow_balance"] == "600"
+
+
+def test_removed_milestone_index_cannot_be_refunded(contract, direct_vm, direct_bob, direct_carol):
+    aid = _active_after_removing_milestone_1(contract, direct_vm, direct_bob, direct_carol)
+    for party in (direct_bob, direct_carol):
+        direct_vm.sender = party
+        with pytest.raises(Exception, match="No such milestone"):
+            contract.confirm_milestone_refund(aid, 1)
+    assert contract.get_agreement(aid)["escrow_balance"] == "600"
+
+
+def test_removed_milestone_index_is_not_readable_and_live_milestone_still_works(
+    contract, direct_vm, direct_bob, direct_carol
+):
+    aid = _active_after_removing_milestone_1(contract, direct_vm, direct_bob, direct_carol)
+    with pytest.raises(Exception, match="No such milestone"):
+        contract.get_milestone(aid, 1)
+    # The surviving milestone is unaffected and the agreement completes on its own.
+    direct_vm.sender = direct_bob
+    contract.approve_milestone(aid, 0)
+    a = contract.get_agreement(aid)
+    assert a["status"] == "COMPLETED"
+    assert a["escrow_balance"] == "0"
+
+
+def test_milestone_index_is_live_again_when_a_later_revision_restores_it(
+    contract, direct_vm, direct_bob, direct_carol
+):
+    warp_to(direct_vm, NOW)
+    mock_consistency(direct_vm, "CONSISTENT")
+    aid = propose_freelance(contract, direct_vm, direct_bob, direct_carol, amounts=(600, 400))
+    direct_vm.sender = direct_bob
+    contract.revise_agreement(
+        aid, FREELANCE_TEXT, 0, 0, "", "", 0, ["Design mockups"], [600], ["2099-03-01"], 0,
+    )
+    with pytest.raises(Exception, match="No such milestone"):
+        contract.get_milestone(aid, 1)
+
+    warp_to(direct_vm, _iso_plus(NOW, 600))
+    mock_consistency(direct_vm, "CONSISTENT")
+    contract.revise_agreement(
+        aid, FREELANCE_TEXT, 0, 0, "", "", 0,
+        ["Design mockups", "Final build"], [600, 400], ["2099-03-01", "2099-06-01"], 0,
+    )
+    restored = contract.get_milestone(aid, 1)
+    assert restored["amount_wei"] == "400"
+    assert restored["status"] == "PENDING"
+
+
+def test_sixth_milestone_dispute_attempt_cannot_execute(contract, direct_vm, direct_bob, direct_carol):
+    aid = _active_freelance(contract, direct_vm, direct_bob, direct_carol)
+    direct_vm.sender = direct_bob
+
+    for attempt in range(5):
+        warp_to(direct_vm, _iso_plus(NOW, 700 * attempt))  # clear the 600s recheck cooldown each time
+        mock_interpretation(direct_vm, "COULD_NOT_DETERMINE")
+        assert contract.dispute_milestone(aid, 0, "Please review again.", "") == "DISPUTED"
+    assert contract.get_milestone(aid, 0)["dispute_attempts"] == 5
+
+    # Cooldown has elapsed, and the mocked verdict would PAY the contractor if the round ran.
+    # Only the attempt cap can be what stops it.
+    warp_to(direct_vm, _iso_plus(NOW, 700 * 5))
+    mock_interpretation(direct_vm, "CONSISTENT_WITH_TERMS")
+    with pytest.raises(Exception, match="attempt limit"):
+        contract.dispute_milestone(aid, 0, "A sixth attempt.", "")
+
+    m = contract.get_milestone(aid, 0)
+    assert m["status"] == "DISPUTED"
+    assert m["dispute_attempts"] == 5
+    assert contract.get_agreement(aid)["escrow_balance"] == "1000"  # nothing paid
+
+
+def test_milestone_can_still_be_approved_after_dispute_attempts_are_exhausted(
+    contract, direct_vm, direct_bob, direct_carol
+):
+    aid = _active_freelance(contract, direct_vm, direct_bob, direct_carol)
+    direct_vm.sender = direct_bob
+    for attempt in range(5):
+        warp_to(direct_vm, _iso_plus(NOW, 700 * attempt))
+        mock_interpretation(direct_vm, "COULD_NOT_DETERMINE")
+        contract.dispute_milestone(aid, 0, "Please review again.", "")
+
+    contract.approve_milestone(aid, 0)  # the client's off-chain-resolution escape hatch is intact
+    assert contract.get_milestone(aid, 0)["status"] == "APPROVED"
+    assert contract.get_agreement(aid)["escrow_balance"] == "400"
