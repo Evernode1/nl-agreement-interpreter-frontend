@@ -1,7 +1,7 @@
 # Agreement Interpreter — frontend
 
 Frontend for the `AgreementInterpreter` Intelligent Contract on [GenLayer](https://genlayer.com)
-(`nl-agreement-interpreter` v1.2). Visual system and wallet flow are adapted from the Proof of Life
+(`nl-agreement-interpreter` v1.3). Visual system and wallet flow are adapted from the Proof of Life
 Vault frontend; the palette and every page are new (ink-blue + paper + quill, instead of vault + brass).
 
 Vite + React + TypeScript + Tailwind, talking to the chain directly through `genlayer-js`.
@@ -36,6 +36,13 @@ No backend, no API keys.
 
 ## Things to know
 
+- **Removed milestones are unreachable (v1.3).** When `revise_agreement` drops milestones, the contract only
+  treats indices in the agreement's *current* milestone list as live. A removed index can never be
+  submitted, approved, disputed, refunded, paid or read (`No such milestone`), and the two money-moving
+  paths re-check this as a safeguard.
+- **Dispute attempt cap (v1.3).** `dispute_milestone` now enforces `MAX_DISPUTE_ATTEMPTS` (5) per milestone,
+  checked before the cooldown and before any validator round starts. A sixth attempt reverts; the client can
+  still `approve_milestone`, or both parties can `confirm_milestone_refund`.
 - **Consensus writes are slow.** `propose`, `revise`, `dispute_milestone` and `raise_dispute` run
   validator rounds, so the client waits up to ~8 minutes for them (vs ~3 for plain writes) and shows a
   "validators are working" notice. Keep the tab open.
@@ -61,3 +68,10 @@ src/
   components/  ui, agreement (badges/stepper/cards), DraftEditor, MilestonesPanel, ActionsPanel, ...
   pages/       Landing, NewAgreement, Dashboard, Explore, AgreementDetail
 ```
+
+## Tests
+
+Direct-mode regression tests live in `tests/direct/test_agreement_interpreter.py`, including the v1.3 cases:
+removed milestone index rejected for submit / approve / dispute / refund, a later revision restoring the
+index, a sixth dispute attempt being unable to execute, and approval still working after the cap is reached.
+Run them with the GenLayer direct-test runner (`pytest tests/direct`).
